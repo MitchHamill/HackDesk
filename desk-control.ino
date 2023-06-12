@@ -1,115 +1,100 @@
-#include <arduino_homekit_server.h>
-#include <base64.h>
-#include <cJSON.h>
-#include <constants.h>
-#include <cQueue.h>
-#include <crypto.h>
-#include <esp_xpgm.h>
-#include <homekit_debug.h>
-#include <http_parser.h>
-#include <json.h>
-#include <pairing.h>
-#include <port.h>
-#include <query_params.h>
-#include <storage.h>
-#include <user_settings.h>
-#include <watchdog.h>
-
-/*
- * switch.ino
- *
- *  Created on: 2020-05-15
- *      Author: Mixiaoxiao (Wang Bin)
- *
- * HAP section 8.38 Switch
- * An accessory contains a switch.
- *
- * This example shows how to:
- * 1. define a switch accessory and its characteristics (in my_accessory.c).
- * 2. get the switch-event sent from iOS Home APP.
- * 3. report the switch value to HomeKit.
- *
- * You should:
- * 1. read and use the Example01_TemperatureSensor with detailed comments
- *    to know the basic concept and usage of this library before other examples。
- * 2. erase the full flash or call homekit_storage_reset() in setup()
- *    to remove the previous HomeKit pairing storage and
- *    enable the pairing with the new accessory of this new HomeKit example.
- */
-
-// #include <Arduino.h>
-#include <arduino_homekit_server.h>
 #include "wifi_info.h"
+#include "log.h"
+#include "desk.h"
+#include "homekit.h"
+#include "buttons.h"
 
-#define LOG_D(fmt, ...)   printf_P(PSTR(fmt "\n") , ##__VA_ARGS__);
+int UP_BUTTON = D3;
+int DOWN_BUTTON = D4;
+int UP_RELAY = D1;
+int DOWN_RELAY = D2;
 
-void setup() {
+int TRIG_PIN = D6;
+int ECHO_PIN = D7;
+SR04 sr04 = SR04(ECHO_PIN, TRIG_PIN);
+
+Desk desk = Desk(UP_RELAY, DOWN_RELAY, sr04);
+
+ButtonWatcher buttons = ButtonWatcher(UP_BUTTON, DOWN_BUTTON);
+
+void change_state(bool up)
+{
+	const bool already_moving = desk.isMoving();
+	if (!already_moving)
+	{
+		desk.trigger_move(up);
+	}
+	else
+	{
+		desk.stop();
+	}
+}
+void s_stand()
+{
+	change_state(true);
+	server.send(200, "text/html", updateWebpage(true));
+}
+void s_sit()
+{
+	change_state(false);
+	server.send(200, "text/html", updateWebpage(false));
+}
+void s_set()
+{
+	desk.set_stand_height();
+	server.send(200, "text/html", updateWebpage(cha_desk_up.value.bool_value));
+}
+
+void cha_desk_up_setter(const homekit_value_t value)
+{
+	bool up = value.bool_value;
+	change_state(up);
+};
+
+void setup()
+{
 	Serial.begin(9600);
-	wifi_connect(); // in wifi_info.h
-	//homekit_storage_reset(); // to remove the previous HomeKit pairing storage when you first run this new HomeKit example
-	my_homekit_setup();
+	wifi_connect();
+	cha_desk_up.setter = cha_desk_up_setter;
+	homekit_setup();
+
+	setup_server(s_stand, s_sit, s_set);
 }
 
-void loop() {
-	my_homekit_loop();
-	delay(10);
-}
-
-//==============================
-// HomeKit setup and loop
-//==============================
-
-// access your HomeKit characteristics defined in my_accessory.c
-extern "C" homekit_server_config_t config;
-extern "C" homekit_characteristic_t cha_switch_on;
-
-static uint32_t next_heap_millis = 0;
-
-int PIN_SWITCH = 2;
-
-void toggleSwitch(bool on) {
-	cha_switch_on.value.bool_value = on;	//sync the value
-	LOG_D("Switch: %s", on ? "ON" : "OFF");
-	digitalWrite(PIN_SWITCH, on ? LOW : HIGH);
-	homekit_characteristic_notify(&cha_switch_on, cha_switch_on.value);
-}
-
-//Called when the switch value is changed by iOS Home APP
-void cha_switch_on_setter(const homekit_value_t value) {
-	bool on = value.bool_value;
-	toggleSwitch(on);
-
-	delay(5000);
-	on = !on;
-	toggleSwitch(on);
-}
-
-void my_homekit_setup() {
-	pinMode(PIN_SWITCH, OUTPUT);
-	digitalWrite(PIN_SWITCH, LOW);
-
-	//Add the .setter function to get the switch-event sent from iOS Home APP.
-	//The .setter should be added before arduino_homekit_setup.
-	//HomeKit sever uses the .setter_ex internally, see homekit_accessories_init function.
-	//Maybe this is a legacy design issue in the original esp-homekit library,
-	//and I have no reason to modify this "feature".
-	cha_switch_on.setter = cha_switch_on_setter;
-	arduino_homekit_setup(&config);
-
-	//report the switch value to HomeKit if it is changed (e.g. by a physical button)
-	//bool switch_is_on = true/false;
-	//cha_switch_on.value.bool_value = switch_is_on;
-	//homekit_characteristic_notify(&cha_switch_on, cha_switch_on.value);
-}
-
-void my_homekit_loop() {
-	arduino_homekit_loop();
-	const uint32_t t = millis();
-	if (t > next_heap_millis) {
-		// show heap info every 5 seconds
-		next_heap_millis = t + 5 * 1000;
-		LOG_D("Free heap: %d, HomeKit clients: %d",
-				ESP.getFreeHeap(), arduino_homekit_connected_clients_count());
-
+static uint32_t next_check_time = 0;
+void loop()
+{
+	server.handleClient();
+	const uint32_t now = millis();
+	const bool run_checks = now > next_check_time;
+	if (run_checks)
+	{
+		next_check_time = now + 10 * 1000;
+	}
+	homekit_loop(run_checks);
+	const ButtonState button_state = buttons.get_state(now);
+	switch (button_state)
+	{
+	case UP_AUTO:
+		desk.trigger_move(true);
+		break;
+	case DOWN_AUTO:
+		desk.trigger_move(false);
+		break;
+	case UP_MAN:
+		desk.go_up();
+		break;
+	case DOWN_MAN:
+		desk.go_down();
+		break;
+	case STOP_MAN:
+		desk.stop();
+		break;
+	case DOUBLE_HOLD:
+		desk.set_stand_height();
+		break;
+	case NO_STATE:
+		desk.loop(run_checks);
+		break;
 	}
 }
